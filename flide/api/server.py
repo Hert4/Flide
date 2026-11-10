@@ -24,7 +24,7 @@ from pydantic import ValidationError
 
 from .. import __version__
 from ..formats.base import check_limits
-from .schema import ModelMetadata, ModelMetadataList, SystemOneRequest
+from .schema import ModelMetadata, ModelMetadataList, SystemOneRequest, Usage
 
 log = logging.getLogger("flide.server")
 
@@ -96,6 +96,17 @@ def create_app(engine, model_name: str, description: str = "", release_date: str
             return engine.decide(req, **options)
 
     async def answer(req, **options):
+        parts = getattr(family, "split", lambda _: None)(req)
+        if parts:
+            # Questions with images of their own run as requests apart, batched together, and merge back in order.
+            done = await asyncio.gather(*(answer(p, **options) for p in parts))
+            merged = {}
+            for r, _ in done:
+                merged.update(r.answers)
+            usage = Usage(input_tokens=sum(r.usage.input_tokens for r, _ in done),
+                          output_tokens=sum(r.usage.output_tokens for r, _ in done))
+            response = done[0][0].model_copy(update={"answers": {q: merged[q] for q in req.questions}, "usage": usage})
+            return response, {**done[0][1], "split": len(parts)}
         if batcher is None:
             return await asyncio.to_thread(decide, req, **options)
         t0 = time.perf_counter()

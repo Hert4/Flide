@@ -42,8 +42,9 @@ LETTERS = string.ascii_uppercase
 MARK = "FLIDE_SPLIT_MARK"
 READ = Read("letters")
 # System One `assets`, as the MISA SGLang fork takes them: images keyed by a reference, each placed where its
-# reference appears in the state. A reference stands in the text as ASSET until the prompt is built.
-ASSET = "\ue000\ue001"
+# reference appears in the state, instructions or criteria. A reference stands in the text as OPEN index CLOSE.
+OPEN, CLOSE = "\ue000", "\ue001"
+ASSET_MARK = re.compile(f"{OPEN}(\\d+){CLOSE}")
 ASSET_MIME = {"png": "png", "jpg": "jpeg", "jpeg": "jpeg"}
 
 
@@ -56,17 +57,16 @@ def _image_url(ref: Any) -> Any:
     return ref
 
 
-def bind_assets(request: SystemOneRequest) -> tuple[Any, list[str]]:
-    """The state with every asset reference replaced by ASSET, and the asset images as data URLs in the order they
-    appear. References match inside string values only: a string that is exactly a reference first, then longer
-    references before shorter ones. Each use is another copy of the image. Assets must sit in the state, the shared
-    prefix every question forks from."""
+def bind_assets(request: SystemOneRequest) -> tuple[Any, dict, list[str]]:
+    """(state, questions, images): the state and questions with every asset reference replaced by its mark, and the
+    asset images as data URLs by reference index. References match inside string values only: a string that is
+    exactly a reference first, then longer references before shorter ones. Each use is another copy of the image."""
     assets = getattr(request, "assets", None) or {}
     if not assets:
-        return request.state, []
+        return request.state, request.questions, []
     if not isinstance(assets, dict):
         raise ValueError("assets: an object of images keyed by reference")
-    urls = {}
+    urls = []
     for ref, a in assets.items():
         if not ref.strip() or len(ref.encode()) > 1024:
             raise ValueError(f"asset reference {ref[:64]!r} must be 1 to 1024 bytes, not blank")
@@ -82,19 +82,20 @@ def bind_assets(request: SystemOneRequest) -> tuple[Any, list[str]]:
             ok = False
         if not ok:
             raise ValueError(f"asset {ref!r} needs data_base64 in standard base64")
-        urls[ref] = f"data:image/{mime};base64,{data}"
+        urls.append(f"data:image/{mime};base64,{data}")
+    marks = {r: f"{OPEN}{i}{CLOSE}" for i, r in enumerate(assets)}
     pattern = re.compile("|".join(map(re.escape, sorted(assets, key=len, reverse=True))))
-    order: list[str] = []
+    used = set()
 
     def use(ref: str) -> str:
-        order.append(ref)
-        return ASSET
+        used.add(ref)
+        return marks[ref]
 
     def mark(v: Any) -> Any:
         if isinstance(v, str):
-            if any(c in v for c in ASSET):
+            if OPEN in v or CLOSE in v:
                 raise ValueError("text must not contain U+E000 or U+E001")
-            return use(v) if v in assets else pattern.sub(lambda m: use(m.group()), v)
+            return use(v) if v in marks else pattern.sub(lambda m: use(m.group()), v)
         if isinstance(v, dict):
             return {k: mark(x) for k, x in v.items()}
         if isinstance(v, list):
@@ -102,24 +103,58 @@ def bind_assets(request: SystemOneRequest) -> tuple[Any, list[str]]:
         return v
 
     state = mark(request.state)
+    questions = {}
     for qid, q in request.questions.items():
-        if pattern.search(json.dumps([q.instructions, q.criteria if not hasattr(q.criteria, "model_dump")
-                                      else q.criteria.model_dump()], ensure_ascii=False)):
-            raise ValueError(f"question {qid!r}: an asset is referenced in instructions or criteria; this server "
-                             "reads assets in the state only")
-    unused = [r for r in assets if r not in order]
+        fields = q.model_dump(exclude_unset=True)
+        for name in ("instructions", "criteria"):
+            if name in fields:
+                fields[name] = mark(fields[name])
+        questions[qid] = type(q).model_validate(fields)
+    unused = [r for r in assets if r not in used]
     if unused:
-        raise ValueError(f"asset {unused[0]!r} is not referenced in the state")
-    return state, [urls[r] for r in order]
+        raise ValueError(f"asset {unused[0]!r} is not referenced in the state, instructions, or criteria")
+    return state, questions, urls
+
+
+def asset_questions(request: SystemOneRequest) -> list[str]:
+    """Ids of the questions whose instructions or criteria name an asset."""
+    assets = getattr(request, "assets", None) or {}
+    if not assets or not isinstance(assets, dict):
+        return []
+    pattern = re.compile("|".join(map(re.escape, sorted(assets, key=len, reverse=True))))
+    return [qid for qid, q in request.questions.items()
+            if pattern.search(json.dumps([q.instructions, q.criteria if not hasattr(q.criteria, "model_dump")
+                                          else q.criteria.model_dump()], ensure_ascii=False))]
+
+
+def split_by_assets(request: SystemOneRequest) -> list[SystemOneRequest] | None:
+    """A request whose questions carry their own images, as requests the server answers apart and merges: one per
+    such question (its images then sit in a prefix of its own), one for the rest (which share the state); None when
+    no question carries an image, or there is only one question."""
+    own = asset_questions(request)
+    if not own or len(request.questions) == 1:
+        return None
+    rest = [q for q in request.questions if q not in own]
+    groups = ([rest] if rest else []) + [[q] for q in own]
+    out = []
+    for g in groups:
+        questions = {q: request.questions[q] for q in g}
+        text = json.dumps([request.state, [[q.instructions, q.criteria if not hasattr(q.criteria, "model_dump")
+                                             else q.criteria.model_dump()] for q in questions.values()]],
+                          ensure_ascii=False)
+        # Each part keeps the assets it names (bind_assets refuses an unused one); the whole request named them all.
+        assets = {r: a for r, a in request.assets.items() if r in text}
+        out.append(request.model_copy(update={"questions": questions, "assets": assets}))
+    return out
 
 
 def _parts(text: str) -> list[dict]:
-    """Chat content parts of text, an image part at each ASSET."""
+    """Chat content parts of text, an image part at each asset mark."""
     out = []
-    for i, piece in enumerate(text.split(ASSET)):
-        if i:
+    for i, piece in enumerate(ASSET_MARK.split(text)):
+        if i % 2:
             out.append({"type": "image"})
-        if piece:
+        elif piece:
             out.append({"type": "text", "text": piece})
     return out
 WIDE = Read("wide")
@@ -139,13 +174,16 @@ def _text(entry: Any) -> str:
 class TokenRows:
     """Output-head rows of some token ids, in float32: their logits for final-norm hidden states."""
 
-    def __init__(self, weight, ids: list[int], bias=None, softcap: float | None = None):
+    def __init__(self, weight, ids: list[int], bias=None, softcap: float | None = None, mass: bool = False):
+        """`mass`: one more column, the log-sum-exp of the logits over the whole vocabulary, so the family can tell how
+        much probability the rows hold (System One `x_label_mass`)."""
         import torch
 
         idx = torch.tensor(ids, device=weight.device)
         self.weight = weight.detach().index_select(0, idx).float().contiguous()
         self.bias = None if bias is None else bias.detach().index_select(0, idx).float()
         self.softcap = softcap
+        self.full = (weight.detach(), None if bias is None else bias.detach()) if mass else None
 
     def __call__(self, hidden):
         from .. import settings
@@ -159,6 +197,15 @@ class TokenRows:
         out = out if self.bias is None else out + self.bias
         if self.softcap:
             out = (out / self.softcap).tanh() * self.softcap
+        if self.full is not None:
+            import torch
+
+            w, b = self.full
+            full = (hidden.to(w.dtype) @ w.T).float()
+            full = full if b is None else full + b.float()
+            if self.softcap:
+                full = (full / self.softcap).tanh() * self.softcap
+            out = torch.cat([out, full.logsumexp(-1, keepdim=True)], -1)
         return out
 
 
@@ -249,9 +296,9 @@ class NextToken(Format):
     def load_heads(self, backbone) -> dict[str, Any]:
         weight, bias = backbone.output_head()
         softcap = getattr(backbone, "logit_softcap", None)
-        heads = {"letters": TokenRows(weight, self.letter_ids, bias, softcap=softcap)}
+        heads = {"letters": TokenRows(weight, self.letter_ids, bias, softcap=softcap, mass=True)}
         if self.pairs:
-            heads["wide"] = TokenRows(weight, self.letter_ids + self.pair_ids, bias, softcap=softcap)
+            heads["wide"] = TokenRows(weight, self.letter_ids + self.pair_ids, bias, softcap=softcap, mass=True)
         return heads
 
 
@@ -278,7 +325,8 @@ class NextToken(Format):
         if kind != "noul" and len(names) > len(labels):
             labels = tuple(LETTERS) + tuple(self.pairs)
             word = "option" if kind == "choice" else "level"
-            reply = f"Answer with the {'letter' if len(names) <= len(LETTERS) else 'label'} of one {word} only."
+            if self.style != "sglang":  # SGLang keeps its one reply line past 26 options
+                reply = f"Answer with the {'letter' if len(names) <= len(LETTERS) else 'label'} of one {word} only."
         if len(names) > len(labels):
             raise ValueError(f"{len(names)} options; a {kind} reads at most {len(labels)}")
         raw = q.instructions
@@ -335,7 +383,7 @@ class NextToken(Format):
         """`images` lead the user turn; assets (ASSET in the state) sit where they appear."""
         text = self._plain(state) if self.style == "sglang" else (
             state if isinstance(state, str) else json.dumps(state, ensure_ascii=False))
-        if images or ASSET in text:
+        if images or OPEN in text or OPEN in suffix:
             user = text + "\n\n" + suffix
             content = [{"type": "image"}] * images + _parts(user)
             return self.processor.apply_chat_template([{"role": "user", "content": content}], tokenize=False,
@@ -440,6 +488,29 @@ class NextToken(Format):
             return [self._render(state, x, images) for x in suffixes]
         return texts
 
+    def split(self, request: SystemOneRequest):
+        return split_by_assets(request)
+
+    def _plan_whole(self, request, state, questions, lead, urls) -> Plan:
+        """One question whose instructions or criteria hold images (split_by_assets gave it a request of its own): the
+        whole prompt but its last token is the prefix, so every image sits in it, rendered as the shared path renders."""
+        if len(questions) != 1:
+            raise ValueError("questions with images of their own are answered one per request (split_by_assets)")
+        (qid, q), = questions.items()
+        kind, names, text, at = self._question_vllm(q)
+        if self.style == "flide":
+            raise ValueError("images: the next_token format takes them in style vllm or sglang")
+        prompt = self._render(state, text, len(lead))
+        user = (self._plain(state) if self.style == "sglang" else (
+            state if isinstance(state, str) else json.dumps(state, ensure_ascii=False))) + "\n\n" + text
+        refs = lead + [urls[int(i)] for i in ASSET_MARK.findall(user)]
+        ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        if len(ids) > self.max_branch_tokens:
+            raise ValueError(f"prompt is {len(ids)} tokens, limit is {self.max_branch_tokens}")
+        reads = (WIDE,) if max(at) >= len(self.labels) else (READ,)
+        prefix, vision = self._vision(ids[:-1], [self._open(r) for r in refs], prompt, ids[-1:])
+        return Plan(prefix, [ids[-1:]], reads, [(qid, kind, (names, at))], vision=vision)
+
     def plan(self, request: SystemOneRequest, **_) -> Plan:
         if self.style != "flide":
             questions = [(qid, kind, (names, at), text)
@@ -448,10 +519,13 @@ class NextToken(Format):
         else:
             questions = [(qid, *self._question(q)) for qid, q in request.questions.items()]
         lead = [_image_url(r) for r in getattr(request, "images", None) or []]
-        state, assets = bind_assets(request)
-        refs = lead + assets
-        if refs and self.style == "flide":
+        state, marked_questions, urls = bind_assets(request)
+        if (lead or urls) and self.style == "flide":
             raise ValueError("images: the next_token format takes them in style vllm or sglang")
+        if urls and asset_questions(request):
+            return self._plan_whole(request, state, marked_questions, lead, urls)
+        refs = lead + [urls[int(i)] for i in ASSET_MARK.findall(self._plain(state) if self.style == "sglang" else (
+            state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)))]
         marked = self._render(state, MARK, len(lead))
         end = marked.index(MARK)
         texts = self._prompts(state, marked, end, [suffix for _, _, _, suffix in questions], len(lead))
@@ -503,6 +577,8 @@ class NextToken(Format):
             w = [math.exp(x - m) for x in logits]
             s = sum(w)
             probs = [x / s for x in w]
+            # The share of the next-token probability on the labels: the last column is the vocabulary's log-sum-exp.
+            mass = round(min(1.0, math.exp(m - out[0][0][-1]) * s), 6)
             if kind == "noul":
                 answers[qid] = make_noul(probs[0])
             elif kind == "choice":
@@ -510,6 +586,7 @@ class NextToken(Format):
             else:
                 levels = list(request.questions[qid].criteria)
                 answers[qid] = make_score(levels, probs)
+            answers[qid].x_label_mass = mass
         usage = Usage(input_tokens=plan.tokens, output_tokens=len(request.questions))
         return SystemOneResponse(model="", answers=answers, usage=usage), {"format": "next_token",
                                                                           "prefix_tokens": len(plan.prefix),

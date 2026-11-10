@@ -77,6 +77,8 @@ class SystemOneRequest(_Lenient):
 class NoulAnswer(BaseModel):
     type: Literal["noul"] = "noul"
     noul: float
+    # MISA extension: the probability the model puts on the valid labels (None where a family does not read it).
+    x_label_mass: float | None = None
 
 
 class ChoiceAnswer(BaseModel):
@@ -84,6 +86,7 @@ class ChoiceAnswer(BaseModel):
     choice: str
     probabilities: dict[str, float]
     confidence: float
+    x_label_mass: float | None = None
 
 
 class ScoreAnswer(BaseModel):
@@ -92,6 +95,7 @@ class ScoreAnswer(BaseModel):
     legend: dict[str, Entry]
     probabilities: dict[str, float]
     confidence: float
+    x_label_mass: float | None = None
 
 
 Answer = Union[NoulAnswer, ChoiceAnswer, ScoreAnswer]
