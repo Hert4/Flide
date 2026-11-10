@@ -129,7 +129,9 @@ def create_app(engine, model_name: str, description: str = "", release_date: str
         return response, meta
 
     def served(requested) -> bool:
-        return isinstance(requested, str) and (requested in aliases or requested == model_name)
+        # Any model name is served, as SGLang's /v1/systemone: the MISA gateway and its LLM filter each send their own
+        # name, and the filter reads a 404 as "no /systemone here" and falls back to chat/completions, which Flide lacks.
+        return True
 
     def not_served(requested) -> JSONResponse:
         return JSONResponse(status_code=404, content={
@@ -219,10 +221,6 @@ def create_app(engine, model_name: str, description: str = "", release_date: str
             req = SystemOneRequest.model_validate(body)
         except ValidationError as exc:
             return _validation_error(exc)
-        requested = req.model or "jev-latest"
-        if requested not in aliases and requested != model_name:
-            return JSONResponse(status_code=404, content={
-                "detail": f"model {requested!r} is not served; available: {model_name} plus aliases {sorted(aliases)}"})
         try:
             options = _query_options(request.query_params, app.state.debias)
         except ValueError as exc:
