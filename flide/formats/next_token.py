@@ -21,9 +21,12 @@ turn, as vLLM places them, at the image processor's own resolution; they belong 
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import io
 import json
 import logging
+import re
 import string
 from typing import Any
 
@@ -38,6 +41,87 @@ log = logging.getLogger("flide.next_token")
 LETTERS = string.ascii_uppercase
 MARK = "FLIDE_SPLIT_MARK"
 READ = Read("letters")
+# System One `assets`, as the MISA SGLang fork takes them: images keyed by a reference, each placed where its
+# reference appears in the state. A reference stands in the text as ASSET until the prompt is built.
+ASSET = "\ue000\ue001"
+ASSET_MIME = {"png": "png", "jpg": "jpeg", "jpeg": "jpeg"}
+
+
+def _image_url(ref: Any) -> Any:
+    """An `images` entry as a data URL or base64: the chat image object ({"url"} or {"image_url": {"url"}}) or the
+    string itself."""
+    if isinstance(ref, dict):
+        ref = ref.get("image_url", ref)
+        ref = ref.get("url") if isinstance(ref, dict) else ref
+    return ref
+
+
+def bind_assets(request: SystemOneRequest) -> tuple[Any, list[str]]:
+    """The state with every asset reference replaced by ASSET, and the asset images as data URLs in the order they
+    appear. References match inside string values only: a string that is exactly a reference first, then longer
+    references before shorter ones. Each use is another copy of the image. Assets must sit in the state, the shared
+    prefix every question forks from."""
+    assets = getattr(request, "assets", None) or {}
+    if not assets:
+        return request.state, []
+    if not isinstance(assets, dict):
+        raise ValueError("assets: an object of images keyed by reference")
+    urls = {}
+    for ref, a in assets.items():
+        if not ref.strip() or len(ref.encode()) > 1024:
+            raise ValueError(f"asset reference {ref[:64]!r} must be 1 to 1024 bytes, not blank")
+        a = a if isinstance(a, dict) else {}
+        if a.get("part") is not None:
+            raise ValueError(f"asset {ref!r} names a multipart part; send data_base64 instead")
+        mime, data = ASSET_MIME.get(a.get("format")), a.get("data_base64")
+        if mime is None:
+            raise ValueError(f"asset {ref!r} format must be png, jpg, or jpeg")
+        try:
+            ok = isinstance(data, str) and bool(base64.b64decode(data, validate=True))
+        except binascii.Error:
+            ok = False
+        if not ok:
+            raise ValueError(f"asset {ref!r} needs data_base64 in standard base64")
+        urls[ref] = f"data:image/{mime};base64,{data}"
+    pattern = re.compile("|".join(map(re.escape, sorted(assets, key=len, reverse=True))))
+    order: list[str] = []
+
+    def use(ref: str) -> str:
+        order.append(ref)
+        return ASSET
+
+    def mark(v: Any) -> Any:
+        if isinstance(v, str):
+            if any(c in v for c in ASSET):
+                raise ValueError("text must not contain U+E000 or U+E001")
+            return use(v) if v in assets else pattern.sub(lambda m: use(m.group()), v)
+        if isinstance(v, dict):
+            return {k: mark(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [mark(x) for x in v]
+        return v
+
+    state = mark(request.state)
+    for qid, q in request.questions.items():
+        if pattern.search(json.dumps([q.instructions, q.criteria if not hasattr(q.criteria, "model_dump")
+                                      else q.criteria.model_dump()], ensure_ascii=False)):
+            raise ValueError(f"question {qid!r}: an asset is referenced in instructions or criteria; this server "
+                             "reads assets in the state only")
+    unused = [r for r in assets if r not in order]
+    if unused:
+        raise ValueError(f"asset {unused[0]!r} is not referenced in the state")
+    return state, [urls[r] for r in order]
+
+
+def _parts(text: str) -> list[dict]:
+    """Chat content parts of text, an image part at each ASSET."""
+    out = []
+    for i, piece in enumerate(text.split(ASSET)):
+        if i:
+            out.append({"type": "image"})
+        if piece:
+            out.append({"type": "text", "text": piece})
+    return out
 WIDE = Read("wide")
 VLLM_LABELS = {"choice": tuple(LETTERS), "noul": ("yes", "no"), "score": tuple(string.digits)}
 VLLM_REPLY = {"choice": "Answer with the letter of one option only.", "noul": "Answer with yes or no only.",
@@ -248,9 +332,12 @@ class NextToken(Format):
         return kind, names, suffix
 
     def _render(self, state: Any, suffix: str, images: int = 0) -> str:
-        if images:
-            user = (state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)) + "\n\n" + suffix
-            content = [{"type": "image"}] * images + [{"type": "text", "text": user}]
+        """`images` lead the user turn; assets (ASSET in the state) sit where they appear."""
+        text = self._plain(state) if self.style == "sglang" else (
+            state if isinstance(state, str) else json.dumps(state, ensure_ascii=False))
+        if images or ASSET in text:
+            user = text + "\n\n" + suffix
+            content = [{"type": "image"}] * images + _parts(user)
             return self.processor.apply_chat_template([{"role": "user", "content": content}], tokenize=False,
                                                       add_generation_prompt=True, **self.template_kwargs)
         if self.style == "sglang":
@@ -360,12 +447,14 @@ class NextToken(Format):
                                                               for qid, q in request.questions.items())]
         else:
             questions = [(qid, *self._question(q)) for qid, q in request.questions.items()]
-        refs = getattr(request, "images", None) or []
+        lead = [_image_url(r) for r in getattr(request, "images", None) or []]
+        state, assets = bind_assets(request)
+        refs = lead + assets
         if refs and self.style == "flide":
-            raise ValueError("images: the next_token format takes them in style vllm")
-        marked = self._render(request.state, MARK, len(refs))
+            raise ValueError("images: the next_token format takes them in style vllm or sglang")
+        marked = self._render(state, MARK, len(lead))
         end = marked.index(MARK)
-        texts = self._prompts(request.state, marked, end, [suffix for _, _, _, suffix in questions], len(refs))
+        texts = self._prompts(state, marked, end, [suffix for _, _, _, suffix in questions], len(lead))
         shared = marked[:end]
         c = self._pieces.last_cut(marked, end - 1) if all(t.startswith(shared) for t in texts) else 0
         head, prefix_tail, *tails = self._pieces.encode(self.tokenizer,
