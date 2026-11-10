@@ -1,0 +1,21 @@
+flide/formats/next_token.py
+  s_7a1359dd27d626::t_a8181a1a80dc1c 24-25,29,44-124,335-340,450-452,454-455,457
+tests/test_assets.py
+  s_7a1359dd27d626::t_ec3054939e14b7 1-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "a1c18574d0e2690a1174508c2c9128feae51dcff",
+  "prompts": {},
+  "sessions": {
+    "s_7a1359dd27d626": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "80999fb1-fc8d-494f-b4e6-013a06e2de8c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "tmduc3 <tmduc3@rd.misa.com.vn>"
+    }
+  }
+}
