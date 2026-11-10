@@ -1,0 +1,23 @@
+flide/api/serve.py
+  s_7a1359dd27d626::t_f9497476847309 49-50,53-55,128
+flide/api/server.py
+  s_7a1359dd27d626::t_eb3813c93b244b 81-110,118
+tests/test_gate.py
+  s_7a1359dd27d626::t_c1d4ff1cb5c1e7 1-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "b609d01515e7a9daca0a668675352fbac314c726",
+  "prompts": {},
+  "sessions": {
+    "s_7a1359dd27d626": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "80999fb1-fc8d-494f-b4e6-013a06e2de8c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "tmduc3 <tmduc3@rd.misa.com.vn>"
+    }
+  }
+}
