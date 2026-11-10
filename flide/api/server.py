@@ -78,6 +78,36 @@ def _query_options(params, debias: int) -> dict:
     return {"debias": int(raw), "debug": flag in ("1", "true", "yes", "on")}
 
 
+class _Gate:
+    """Bearer key (FLIDE_API_KEY, set by `--api-key`) on every route but /health, and the ingress path prefix
+    (RUNAI_PATH_PREFIX: Run:AI keeps /<project>/<workload> on the path) stripped, so the server runs behind Run:AI as
+    SGLang does. Read from the environment so `--frontends` processes get them too."""
+
+    def __init__(self, app):
+        import os
+
+        self.app = app
+        self.key = os.environ.get("FLIDE_API_KEY", "")
+        self.prefix = os.environ.get("RUNAI_PATH_PREFIX", "").rstrip("/")
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = scope["path"]
+            if self.prefix and (path == self.prefix or path.startswith(self.prefix + "/")):
+                scope = dict(scope, path=path[len(self.prefix):] or "/")
+                raw = scope.get("raw_path")
+                if isinstance(raw, (bytes, bytearray)) and raw.startswith(self.prefix.encode()):
+                    scope["raw_path"] = raw[len(self.prefix):] or b"/"
+            if self.key and scope["path"] != "/health":
+                import hmac
+
+                auth = dict(scope.get("headers") or []).get(b"authorization", b"")
+                if not hmac.compare_digest(auth, b"Bearer " + self.key.encode()):
+                    await JSONResponse(status_code=401, content={"detail": "invalid API key"})(scope, receive, send)
+                    return
+        await self.app(scope, receive, send)
+
+
 def create_app(engine, model_name: str, description: str = "", release_date: str = "", batcher=None,
                ready=None) -> FastAPI:
     """`ready`, when given, is asked by /health (503 "loading" until it says yes): front ends start before the model
@@ -85,6 +115,7 @@ def create_app(engine, model_name: str, description: str = "", release_date: str
     family = engine.format
     aliases = set(family.aliases) | {"jev-latest"}
     app = FastAPI(title="flide", version=__version__)
+    app.add_middleware(_Gate)
     app.state.engine = engine
     app.state.debias = 1
     lock = threading.Lock()

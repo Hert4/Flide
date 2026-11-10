@@ -46,7 +46,12 @@ def freeze_heap() -> None:
 
 
 def run(args) -> None:
+    import os
+
     import uvicorn
+
+    if args.api_key:
+        os.environ["FLIDE_API_KEY"] = args.api_key  # before any front end process starts
 
     from .. import formats, settings
     from ..runtime.engine import Engine, model_config, resolve_model
@@ -120,6 +125,7 @@ def add_parser(sub) -> None:
                    help="wait this long after the first waiting request for more to join its GPU round")
     s.add_argument("--gather-ms", type=float, default=None,
                    help="wait up to this long for requests still being planned to join a round (default 2)")
+    s.add_argument("--api-key", default=None, help="bearer key every route but /health requires (also FLIDE_API_KEY)")
     s.add_argument("--host", default="0.0.0.0")
     s.add_argument("--port", type=int, default=8000)
     s.add_argument("--access-log", action="store_true",
