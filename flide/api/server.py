@@ -3,6 +3,7 @@
     POST /v1/systemone   answer typed questions about a state; {"requests": [...]} answers several in one body
     GET  /v1/models      served model and its aliases
     GET  /health
+    GET  /metrics        Prometheus text: /v1/systemone requests by status and their server time
     POST /flush_cache    empty the session cache
     GET  /               playground
 
@@ -31,6 +32,21 @@ log = logging.getLogger("flide.server")
 
 MAX_BATCH = 1024
 
+# /v1/systemone requests by status, and their total server time, for GET /metrics.
+# ponytail: per process; with --frontends each front end counts only its own requests.
+_REQS: dict[int, int] = {}
+_SECONDS = [0.0]
+
+
+def _metrics_text() -> str:
+    n = sum(_REQS.values())
+    lines = ["# TYPE flide_requests_total counter"]
+    lines += [f'flide_requests_total{{path="/v1/systemone",status="{k}"}} {v}' for k, v in sorted(_REQS.items())]
+    lines += ["# TYPE flide_request_duration_seconds summary",
+              f"flide_request_duration_seconds_sum {_SECONDS[0]:.6f}",
+              f"flide_request_duration_seconds_count {n}", ""]
+    return "\n".join(lines)
+
 
 def _validation_error(exc: ValidationError, loc: tuple = ("body",)) -> JSONResponse:
     detail = [{"loc": [*loc, *[str(x) for x in e["loc"]]], "msg": e["msg"], "type": e["type"]} for e in exc.errors()]
@@ -57,6 +73,9 @@ class _Stamp:
 
         async def stamped(message):
             if message["type"] == "http.response.start":
+                if scope["path"].endswith("/v1/systemone"):
+                    _REQS[message["status"]] = _REQS.get(message["status"], 0) + 1
+                    _SECONDS[0] += time.perf_counter() - t0
                 headers = list(message.get("headers", ()))
                 headers.append((b"x-typesafe-request-id", rid))
                 headers.append((b"x-flide-server-time-ms", f"{(time.perf_counter() - t0) * 1000:.1f}".encode()))
@@ -79,7 +98,7 @@ def _query_options(params, debias: int) -> dict:
 
 
 class _Gate:
-    """Bearer key (FLIDE_API_KEY, set by `--api-key`) on every route but /health, and the ingress path prefix
+    """Bearer key (FLIDE_API_KEY, set by `--api-key`) on every route but /health and /metrics, and the ingress path prefix
     (RUNAI_PATH_PREFIX: Run:AI keeps /<project>/<workload> on the path) stripped, so the server runs behind Run:AI as
     SGLang does. Read from the environment so `--frontends` processes get them too."""
 
@@ -98,7 +117,7 @@ class _Gate:
                 raw = scope.get("raw_path")
                 if isinstance(raw, (bytes, bytearray)) and raw.startswith(self.prefix.encode()):
                     scope["raw_path"] = raw[len(self.prefix):] or b"/"
-            if self.key and scope["path"] != "/health":
+            if self.key and scope["path"] not in ("/health", "/metrics"):
                 import hmac
 
                 auth = dict(scope.get("headers") or []).get(b"authorization", b"")
@@ -230,6 +249,12 @@ def create_app(engine, model_name: str, description: str = "", release_date: str
             return JSONResponse({"status": "loading", "model": model_name}, status_code=503)
         return {"status": "ok", "model": model_name, "format": family.name, "engine": "flide",
                 "version": __version__}
+
+    @app.get("/metrics")
+    async def metrics():
+        from fastapi.responses import PlainTextResponse
+
+        return PlainTextResponse(_metrics_text(), media_type="text/plain; version=0.0.4")
 
     @app.get("/v1/models")
     async def models() -> ModelMetadataList:
