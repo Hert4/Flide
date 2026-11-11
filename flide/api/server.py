@@ -3,7 +3,7 @@
     POST /v1/systemone   answer typed questions about a state; {"requests": [...]} answers several in one body
     GET  /v1/models      served model and its aliases
     GET  /health
-    GET  /metrics        Prometheus text: /v1/systemone requests by status and their server time
+    GET  /metrics        Prometheus text under SGLang's names (`flide.api.metrics`)
     POST /flush_cache    empty the session cache
     GET  /               playground
 
@@ -25,28 +25,13 @@ from pydantic import ValidationError
 
 from .. import __version__
 from ..formats.base import check_limits
+from .metrics import Metrics
 from .schema import ModelMetadata, ModelMetadataList, SystemOneRequest, Usage
 
 log = logging.getLogger("flide.server")
 
 
 MAX_BATCH = 1024
-
-# /v1/systemone requests by status, and their total server time, for GET /metrics.
-# ponytail: per process; with --frontends each front end counts only its own requests.
-_REQS: dict[int, int] = {}
-_SECONDS = [0.0]
-
-
-def _metrics_text() -> str:
-    n = sum(_REQS.values())
-    lines = ["# TYPE flide_requests_total counter"]
-    lines += [f'flide_requests_total{{path="/v1/systemone",status="{k}"}} {v}' for k, v in sorted(_REQS.items())]
-    lines += ["# TYPE flide_request_duration_seconds summary",
-              f"flide_request_duration_seconds_sum {_SECONDS[0]:.6f}",
-              f"flide_request_duration_seconds_count {n}", ""]
-    return "\n".join(lines)
-
 
 def _validation_error(exc: ValidationError, loc: tuple = ("body",)) -> JSONResponse:
     detail = [{"loc": [*loc, *[str(x) for x in e["loc"]]], "msg": e["msg"], "type": e["type"]} for e in exc.errors()]
@@ -61,28 +46,37 @@ class _Stamp:
     """Request id and server time headers, as a plain ASGI middleware (Starlette's `@app.middleware` runs every
     request through extra tasks and streams, which costs CPU the GPU thread and the planners need under load)."""
 
-    def __init__(self, app):
+    def __init__(self, app, metrics):
         self.app = app
+        self.metrics = metrics
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        counted = scope["path"].endswith("/v1/systemone")
+        if counted:
+            self.metrics.running += 1
         rid = next((v for k, v in scope.get("headers", ()) if k == b"x-typesafe-request-id"), None)
         rid = rid or f"flide-{uuid.uuid4().hex[:16]}".encode()
         t0 = time.perf_counter()
 
         async def stamped(message):
+            nonlocal counted
             if message["type"] == "http.response.start":
-                if scope["path"].endswith("/v1/systemone"):
-                    _REQS[message["status"]] = _REQS.get(message["status"], 0) + 1
-                    _SECONDS[0] += time.perf_counter() - t0
+                if counted:
+                    counted = False
+                    self.metrics.finished(time.perf_counter() - t0, message["status"] == 200)
                 headers = list(message.get("headers", ()))
                 headers.append((b"x-typesafe-request-id", rid))
                 headers.append((b"x-flide-server-time-ms", f"{(time.perf_counter() - t0) * 1000:.1f}".encode()))
                 message = {**message, "headers": headers}
             await send(message)
 
-        await self.app(scope, receive, stamped)
+        try:
+            await self.app(scope, receive, stamped)
+        finally:
+            if counted:  # no response started: client gone or the app raised
+                self.metrics.finished(time.perf_counter() - t0, False)
 
 
 def _query_options(params, debias: int) -> dict:
@@ -236,12 +230,14 @@ def create_app(engine, model_name: str, description: str = "", release_date: str
                 raise out
         results = []
         for response, meta in outs:
+            metrics.usage(response.usage)
             item = payload_of(response, meta)
             item.pop("model", None)
             results.append(item)
         return JSONResponse(content={"model": model_name, "results": results})
 
-    app.add_middleware(_Stamp)
+    metrics = Metrics(model_name, engine)
+    app.add_middleware(_Stamp, metrics=metrics)
 
     @app.get("/health")
     async def health():
@@ -251,10 +247,10 @@ def create_app(engine, model_name: str, description: str = "", release_date: str
                 "version": __version__}
 
     @app.get("/metrics")
-    async def metrics():
+    async def get_metrics():
         from fastapi.responses import PlainTextResponse
 
-        return PlainTextResponse(_metrics_text(), media_type="text/plain; version=0.0.4")
+        return PlainTextResponse(metrics.text(), media_type="text/plain; version=0.0.4")
 
     @app.get("/v1/models")
     async def models() -> ModelMetadataList:
@@ -285,6 +281,7 @@ def create_app(engine, model_name: str, description: str = "", release_date: str
         try:
             check_limits(family, req)
             response, meta = await answer(req, **options)
+            metrics.usage(response.usage)
         except ValueError as exc:
             return JSONResponse(status_code=422,
                                 content={"detail": [{"loc": ["body"], "msg": str(exc), "type": "value_error"}]})

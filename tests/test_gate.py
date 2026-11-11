@@ -37,5 +37,6 @@ def test_metrics_open_and_counted(monkeypatch):
     before = c.get("/metrics").text                              # open, like SGLang's /metrics
     c.post("/proj/wl/v1/systemone", content=b"{", headers={"Authorization": "Bearer k1"})  # 422
     after = c.get("/metrics")
-    assert after.status_code == 200 and before != after.text
-    assert 'flide_requests_total{path="/v1/systemone",status="422"}' in after.text
+    assert after.status_code == 200 and before != after.text   # a 422 is not a finished request ...
+    assert 'sglang:num_requests_total{model_name="m"} 0' in after.text
+    assert 'sglang:num_running_reqs{model_name="m"} 0' in after.text  # ... and leaves nothing running
